@@ -435,50 +435,30 @@ async def extract_supplier_code(page):
 
 async def extract_direct_oem(page):
     """
-    Numer prod.
-
-    Наприклад:
-        Numer prod.: 1997220
+    Extracts the OEM from Numer prod.
+    Example: KS27/32
     """
 
-    fullname = page.locator(
-        "#product-fullname"
-    )
+    fullname = page.locator("#product-fullname")
 
     if await fullname.count() == 0:
-
         return ""
 
-    h4 = fullname.locator(
-        "xpath=.//h4[starts-with("
-        "normalize-space(.), "
-        "'Numer prod.:')]"
+    parent = fullname.locator("xpath=..")
+
+    h4 = parent.locator(
+        "xpath=./h4[starts-with(normalize-space(.), 'Numer prod.:')]"
     )
 
     if await h4.count() == 0:
-
         return ""
 
-    text = await h4.first.inner_text()
+    oem_span = h4.first.locator("xpath=./span")
 
-    text = " ".join(
-        text.split()
-    ).strip()
+    if await oem_span.count() == 0:
+        return ""
 
-    prefix = "Numer prod.:"
-
-    if prefix.lower() in text.lower():
-
-        oem = text.split(
-            ":",
-            1
-        )[1].strip()
-
-    else:
-
-        oem = ""
-
-    return oem
+    return (await oem_span.first.locator("xpath=text()").all_text_contents())[0].strip()
 
 
 # ============================================================
