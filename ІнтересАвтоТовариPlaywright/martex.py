@@ -1,9 +1,10 @@
 from tkinter import ttk
 from pathlib import Path
-from playwright_app_general import compact_button, bind_universal_clipboard
+from playwright_app_general import compact_button
 
 import playwright_app_general
 import browser
+import producer_map
 
 
 # ============================================================
@@ -32,13 +33,9 @@ PRODUCT_OUTPUT_DIR = Path(__file__).with_name(
 )
 
 
-# ============================================================
-# UI state
-# ============================================================
-
-_name_entry = None
-_oem_entry = None
-_root = None
+# Назва/опис товару для LLM.
+# GOOGLE_LLM читає його кнопкою «Забрати товар».
+NAME_DESC_FILE = "name_desc_to_process.txt"
 
 
 # ============================================================
@@ -742,213 +739,40 @@ async def extract_main_oem(
     return article
 
 
-async def extract_our_product_article(
-    page,
-    article,
-    producer
-):
-
-    article = str(
-        article or ""
-    ).strip()
-
-    producer = str(
-        producer or ""
-    ).strip()
-
-    if not article:
-
-        raise ValueError(
-            "Martex: порожній article."
-        )
-
-    oems, producers = (
-        await extract_oems_and_producers(
-            page
-        )
-    )
-
-    # ========================================================
-    # ОРИГІНАЛЬНИЙ ТОВАР
-    # ========================================================
-
-    if is_original_producer(
-        producer
-    ):
-
-        original_producer = (
-            normalize_original_producer(
-                producer
-            )
-        )
-
-        if not original_producer:
-
-            return article
-
-        for i, table_producer in enumerate(
-            producers
-        ):
-
-            if i >= len(oems):
-
-                continue
-
-            if not producers_match(
-                original_producer,
-                table_producer
-            ):
-
-                continue
-
-            oem = str(
-                oems[i]
-            ).strip()
-
-            if not oem:
-
-                continue
-
-            return (
-                f"{oem}"
-                f"{original_producer}"
-            )
-
-        return (
-            f"{article}"
-            f"{original_producer}"
-        )
-
-    # ========================================================
-    # НЕОРИГІНАЛЬНИЙ ТОВАР
-    # ========================================================
-
-    if not oems:
-
-        return article
-
-    # --------------------------------------------------------
-    # 1. Спочатку шукаємо оригінальний OEM
-    # --------------------------------------------------------
-
-    for i, table_producer in enumerate(
-        producers
-    ):
-
-        if i >= len(oems):
-
-            continue
-
-        if not is_original_producer(
-            table_producer
-        ):
-
-            continue
-
-        oem = str(
-            oems[i]
-        ).strip()
-
-        if not oem:
-
-            continue
-
-        original_producer = (
-            normalize_original_producer(
-                table_producer
-            )
-        )
-
-        if not original_producer:
-
-            continue
-
-        return (
-            f"{oem}"
-            f"{original_producer}"
-        )
-
-    # --------------------------------------------------------
-    # 2. Оригінального OEM немає.
-    # --------------------------------------------------------
-
-    first_oem = str(
-        oems[0]
-    ).strip()
-
-    first_producer = ""
-
-    if producers:
-
-        first_producer = (
-            normalize_original_producer(
-                producers[0]
-            )
-        )
-
-    if first_oem and first_producer:
-
-        return (
-            f"{first_oem}"
-            f"{first_producer}"
-        )
-
-    if first_oem:
-
-        return first_oem
-
-    return article
-
-
 # ============================================================
-# Alternative product article
+# Article
 # ============================================================
 
-async def extract_product_article_with_producer(
-    page,
-    article,
+def make_article(
+    supplier_code,
     producer
 ):
     """
-    Alternative article:
+    Артикль Martex — ОДИН варіант:
 
-        supplier article + producer
+        артикль постачальника + виробник(підстановка)
 
-    No OEM logic is applied.
-    No OEM table is used.
-    No producer mapping is used.
+    Підстановка — producers_martex.csv.
+    Виробника немає у словнику -> пишемо як є.
+    Виробника немає взагалі    -> тільки артикль.
 
-    Example:
-
-        article  = 1997220
-        producer = OE DAF
-
-        result = 1997220OE DAF
+    Ніяких пошуків по OEM-таблиці.
     """
 
-    article = str(
-        article or ""
+    supplier_code = str(
+        supplier_code or ""
     ).strip()
 
-    producer = str(
-        producer or ""
-    ).strip()
-
-    if not article:
+    if not supplier_code:
 
         raise ValueError(
-            "Martex: порожній supplier article."
+            "Martex: порожній артикул постачальника."
         )
 
-    if not producer:
-
-        raise ValueError(
-            "Martex: порожній producer."
-        )
-
-    return (
-        f"{article}"
-        f"{producer}"
+    return producer_map.build_article(
+        supplier_code,
+        producer,
+        producer_map.MARTEX_PRODUCERS_FILE
     )
 
 
@@ -970,30 +794,24 @@ async def search():
             context
         )
 
-        # Спочатку активуємо вкладку
-        # і саме вікно Edge.
         await activate_page(
             page
         )
 
-        search_input = page.locator(
-            "#ctl00_box_3_tbQuickSearch"
+        # Edge на передній план.
+        browser.bring_edge_window_to_front()
+
+        # Поле очищається повністю перед введенням.
+        await browser.type_search_query(
+            page,
+            "#ctl00_box_3_tbQuickSearch",
+            query
         )
 
-        await search_input.click()
-        await search_input.press("Control+A")
-        await search_input.press("Backspace")
-
-        await search_input.press_sequentially(
-            query,
-            delay=70
-        )
-
-        search_button = page.locator(
+        # Результатів НЕ чекаємо.
+        await page.locator(
             "#ctl00_box_3_btnQuickSearch"
-        )
-
-        await search_button.click()
+        ).click()
 
         return (
             f"Пошук Martex: "
@@ -1009,7 +827,7 @@ async def search():
 
 
 # ============================================================
-# Get product - standard
+# Get product
 # ============================================================
 
 async def get_product():
@@ -1055,22 +873,12 @@ async def get_product():
             )
         )
 
-        # ====================================================
-        # Наш внутрішній article
-        # ====================================================
-
-        article = (
-            await extract_our_product_article(
-                page,
-                supplier_code,
-                producer
-            )
+        article = make_article(
+            supplier_code,
+            producer
         )
 
-        # ====================================================
-        # Main OEM
-        # ====================================================
-
+        # Main OEM — для LLM (oem_main.txt).
         oem = await extract_main_oem(
             page,
             supplier_code,
@@ -1101,11 +909,13 @@ async def get_product():
             oem
         )
 
-        # ====================================================
-        # Результат
-        # ====================================================
+        # Назва -> файл для LLM.
+        save_product_output(
+            NAME_DESC_FILE,
+            name
+        )
 
-        result = {
+        return {
             "name": name,
             "oem": oem,
             "supplier_code": supplier_code,
@@ -1114,25 +924,6 @@ async def get_product():
             "price": price,
         }
 
-        if _root is not None:
-
-            _root.after(
-                0,
-                lambda data=result:
-                    update_product_fields(
-                        data.get(
-                            "name",
-                            ""
-                        ),
-                        data.get(
-                            "oem",
-                            ""
-                        )
-                    )
-            )
-
-        return result
-
     finally:
 
         await browser.disconnect(
@@ -1142,10 +933,10 @@ async def get_product():
 
 
 # ============================================================
-# Get standard article only
+# Get article only
 # ============================================================
 
-async def get_product_article_standard():
+async def get_product_article():
 
     playwright, browser_instance, context = (
         await browser.connect()
@@ -1157,96 +948,27 @@ async def get_product_article_standard():
             context
         )
 
-        # Activate page before interaction
         await activate_page(
             page
         )
 
-        # Supplier article
         supplier_code = (
             await extract_martex_product_article(
                 page
             )
         )
 
-        # Producer
         producer = (
             await extract_product_producer(
                 page
             )
         )
 
-        # Standard internal article
-        article = (
-            await extract_our_product_article(
-                page,
-                supplier_code,
-                producer
-            )
+        article = make_article(
+            supplier_code,
+            producer
         )
 
-        # Save only article
-        save_product_output(
-            "article.txt",
-            article
-        )
-
-        return article
-
-    finally:
-
-        await browser.disconnect(
-            playwright,
-            browser_instance
-        )
-
-
-# ============================================================
-# Get alternative article only
-# ============================================================
-
-async def get_product_article_producer():
-
-    playwright, browser_instance, context = (
-        await browser.connect()
-    )
-
-    try:
-
-        page = await get_product_page(
-            context
-        )
-
-        # Activate page before interaction
-        await activate_page(
-            page
-        )
-
-        # Supplier article
-        supplier_code = (
-            await extract_martex_product_article(
-                page
-            )
-        )
-
-        # Producer
-        producer = (
-            await extract_product_producer(
-                page
-            )
-        )
-
-        # Alternative article:
-        # supplier article + producer
-        article = (
-            await extract_product_article_with_producer(
-                page,
-                supplier_code,
-                producer
-            )
-        )
-
-        # Save only article
         save_product_output(
             "article.txt",
             article
@@ -1342,90 +1064,11 @@ async def extract_oems():
 
 
 # ============================================================
-# Update UI fields
-# ============================================================
-
-def update_product_fields(
-    name="",
-    oem=""
-):
-
-    if _name_entry is not None:
-
-        _name_entry.delete(
-            0,
-            "end"
-        )
-
-        _name_entry.insert(
-            0,
-            str(name or "").strip()
-        )
-
-    if _oem_entry is not None:
-
-        _oem_entry.delete(
-            0,
-            "end"
-        )
-
-        _oem_entry.insert(
-            0,
-            str(oem or "").strip()
-        )
-
-
-# ============================================================
-# Send Name + OEM to LLM
-# ============================================================
-
-def send_name_oem_to_llm(
-    run_command
-):
-
-    name = ""
-
-    if _name_entry is not None:
-
-        name = _name_entry.get().strip()
-
-    oem = ""
-
-    if _oem_entry is not None:
-
-        oem = _oem_entry.get().strip()
-
-    if not name:
-
-        print(
-            "[MARTEX] "
-            "Не задано назву товару для LLM."
-        )
-
-        return
-
-    if not oem:
-
-        print(
-            "[MARTEX] "
-            "Не задано OEM для LLM."
-        )
-
-        return
-
-    value = {
-        "name": name,
-        "oem": oem
-    }
-
-    run_command(
-        "GOOGLE_LLM",
-        "LLM_SET_DATA",
-        value
-    )
-
-# ============================================================
 # Martex UI
+#
+# Текстових полів немає: назва та OEM пишуться у файли
+# (name_desc_to_process.txt, oem_main.txt),
+# а GOOGLE_LLM забирає їх кнопкою «Забрати товар».
 # ============================================================
 
 def create_ui(
@@ -1433,95 +1076,12 @@ def create_ui(
     run_command
 ):
 
-    global _name_entry
-    global _oem_entry
-    global _root
-
-    _root = parent.winfo_toplevel()
-
     frame = ttk.LabelFrame(
         parent,
         text="Martex",
         padding=1,
         style="Compact.TLabelframe"
     )
-
-    # --------------------------------------------------------
-    # NAME
-    # --------------------------------------------------------
-
-    name_frame = ttk.Frame(
-        frame,
-        style="Compact.TFrame"
-    )
-
-    name_frame.pack(
-        fill="x",
-        pady=(0, 1)
-    )
-
-    ttk.Label(
-        name_frame,
-        text="На розбір - Martex:",
-        style="Compact.TLabel"
-    ).pack(
-        anchor="w"
-    )
-
-    name_entry = ttk.Entry(
-        name_frame,
-        style="Compact.TEntry"
-    )
-
-    name_entry.pack(
-        fill="x"
-    )
-
-    bind_universal_clipboard(
-        name_entry
-    )
-
-    # --------------------------------------------------------
-    # OEM
-    # --------------------------------------------------------
-
-    oem_frame = ttk.Frame(
-        frame,
-        style="Compact.TFrame"
-    )
-
-    oem_frame.pack(
-        fill="x",
-        pady=(0, 1)
-    )
-
-    ttk.Label(
-        oem_frame,
-        text="OEM Martex:",
-        style="Compact.TLabel"
-    ).pack(
-        anchor="w"
-    )
-
-    oem_entry = ttk.Entry(
-        oem_frame,
-        style="Compact.TEntry"
-    )
-
-    oem_entry.pack(
-        fill="x"
-    )
-
-    bind_universal_clipboard(
-        oem_entry
-    )
-
-    _name_entry = name_entry
-    _oem_entry = oem_entry
-
-    # --------------------------------------------------------
-    # Buttons
-    # --------------------------------------------------------
 
     buttons = ttk.Frame(
         frame,
@@ -1542,134 +1102,32 @@ def create_ui(
         weight=1
     )
 
-    # --------------------------------------------------------
-    # Пошук
-    # --------------------------------------------------------
+    layout = [
+        ("Пошук", "SEARCH", 0, 0),
+        ("Витягнути товар", "GET_PRODUCT", 0, 1),
+        ("Артикль + виробник", "ARTICLE", 1, 0),
+        ("Витягнути OEMи", "EXTRACT_OEMS", 1, 1),
+    ]
 
-    search_button = compact_button(
-        buttons,
-        text="Пошук",
-        command=lambda: run_command(
-            "MARTEX",
-            "SEARCH"
+    for text, command, row, column in layout:
+
+        compact_button(
+            buttons,
+            text=text,
+            command=lambda c=command: run_command(
+                "MARTEX",
+                c
+            )
+        ).grid(
+            row=row,
+            column=column,
+            padx=1,
+            pady=1,
+            sticky="ew"
         )
-    )
-
-    search_button.grid(
-        row=0,
-        column=0,
-        padx=1,
-        pady=1,
-        sticky="ew"
-    )
-
-    # --------------------------------------------------------
-    # Витягнути товар
-    # --------------------------------------------------------
-
-    product_button = compact_button(
-        buttons,
-        text="Витягнути товар",
-        command=lambda: run_command(
-            "MARTEX",
-            "GET_PRODUCT"
-        )
-    )
-
-    product_button.grid(
-        row=0,
-        column=1,
-        padx=1,
-        pady=1,
-        sticky="ew"
-    )
-
-    # --------------------------------------------------------
-    # Standard article
-    # --------------------------------------------------------
-
-    standard_button = compact_button(
-        buttons,
-        text="Стандартний артикль",
-        command=lambda: run_command(
-            "MARTEX",
-            "GET_PRODUCT_STANDARD"
-        )
-    )
-
-    standard_button.grid(
-        row=1,
-        column=0,
-        padx=1,
-        pady=1,
-        sticky="ew"
-    )
-
-    # --------------------------------------------------------
-    # Article + producer
-    # --------------------------------------------------------
-
-    producer_button = compact_button(
-        buttons,
-        text="Артикль + виробник",
-        command=lambda: run_command(
-            "MARTEX",
-            "GET_PRODUCT_PRODUCER"
-        )
-    )
-
-    producer_button.grid(
-        row=1,
-        column=1,
-        padx=1,
-        pady=1,
-        sticky="ew"
-    )
-
-    # --------------------------------------------------------
-    # Витягнути OEMи
-    # --------------------------------------------------------
-
-    oems_button = compact_button(
-        buttons,
-        text="Витягнути OEMи",
-        command=lambda: run_command(
-            "MARTEX",
-            "EXTRACT_OEMS"
-        )
-    )
-
-    oems_button.grid(
-        row=2,
-        column=0,
-        columnspan=2,
-        padx=1,
-        pady=1,
-        sticky="ew"
-    )
-
-    # --------------------------------------------------------
-    # Передати Name + OEM в LLM
-    # --------------------------------------------------------
-
-    llm_button = compact_button(
-        buttons,
-        text="Передати Name + OEM в LLM",
-        command=lambda: send_name_oem_to_llm(
-            run_command
-        )
-    )
-
-    llm_button.grid(
-        row=3,
-        column=0,
-        columnspan=2,
-        padx=1,
-        pady=1,
-        sticky="ew"
-    )
 
     return frame
+
 
 # ============================================================
 # Command dispatcher
@@ -1698,29 +1156,25 @@ async def handle_command(
                     "value має бути рядком."
                 )
 
-            value = value.strip()
-
             playwright_app_general.set_query(
-                value
+                value.strip()
             )
 
         return await search()
-
-    # --------------------------------------------------------
-    # Existing standard command
-    # --------------------------------------------------------
 
     if action == "GET_PRODUCT":
 
         return await get_product()
 
-    if action == "GET_PRODUCT_STANDARD":
+    # GET_PRODUCT_STANDARD / GET_PRODUCT_PRODUCER —
+    # старі назви, залишені для сумісності з VBA.
+    if action in (
+        "ARTICLE",
+        "GET_PRODUCT_STANDARD",
+        "GET_PRODUCT_PRODUCER",
+    ):
 
-        return await get_product_article_standard()
-
-    if action == "GET_PRODUCT_PRODUCER":
-
-        return await get_product_article_producer()
+        return await get_product_article()
 
     if action == "EXTRACT_OEMS":
 

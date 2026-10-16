@@ -92,13 +92,73 @@ async def connect():
 # Edge window activation
 # ============================================================
 
+class WINDOWPLACEMENT(ctypes.Structure):
+    _fields_ = [
+        ("length", ctypes.c_uint),
+        ("flags", ctypes.c_uint),
+        ("showCmd", ctypes.c_uint),
+        ("ptMinPosition", ctypes.c_long * 2),
+        ("ptMaxPosition", ctypes.c_long * 2),
+        ("rcNormalPosition", ctypes.c_long * 4),
+    ]
+
+
+user32.GetWindowPlacement.argtypes = [ctypes.c_void_p, ctypes.POINTER(WINDOWPLACEMENT)]
+user32.GetWindowPlacement.restype = ctypes.c_bool
+user32.IsIconic.argtypes = [ctypes.c_void_p]
+user32.IsIconic.restype = ctypes.c_bool
+
+SW_SHOWMAXIMIZED = 3
+SW_SHOW = 5
+SW_MINIMIZE = 6
+SW_RESTORE = 9
+WPF_RESTORETOMAXIMIZED = 0x0002
+
+
+def restore_window_keep_state(hwnd):
+    """
+    Показує вікно, НЕ змінюючи його розмір:
+
+        - не згорнуте          -> нічого не чіпаємо
+                                  (розгорнуте лишається розгорнутим);
+        - згорнуте з maximized -> розгортаємо на весь екран;
+        - згорнуте з normal    -> повертаємо звичайний розмір.
+
+    Раніше завжди викликався SW_RESTORE, який
+    розгорнуте вікно перетворював на маленьке.
+    """
+
+    if not user32.IsIconic(hwnd):
+        return
+
+    placement = WINDOWPLACEMENT()
+    placement.length = ctypes.sizeof(WINDOWPLACEMENT)
+
+    if (
+        user32.GetWindowPlacement(hwnd, ctypes.byref(placement))
+        and placement.flags & WPF_RESTORETOMAXIMIZED
+    ):
+        user32.ShowWindow(hwnd, SW_SHOWMAXIMIZED)
+    else:
+        user32.ShowWindow(hwnd, SW_RESTORE)
+
+
 def minimize_excel():
     """Minimize the active foreground window if it belongs to Excel."""
     try:
         hwnd = user32.GetForegroundWindow()
-        if hwnd:
-            SW_MINIMIZE = 6
-            user32.ShowWindow(hwnd, SW_MINIMIZE)
+        if not hwnd:
+            return
+
+        pid = ctypes.c_ulong()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+
+        # Згортаємо ТІЛЬКИ Excel. Раніше згортався будь-який
+        # активний застосунок (включно з самим Playwright-вікном).
+        if psutil.Process(pid.value).name().lower() != "excel.exe":
+            return
+
+        user32.ShowWindow(hwnd, SW_MINIMIZE)
     except Exception:
         pass
 
@@ -176,9 +236,9 @@ def bring_edge_window_to_front():
         if not target_hwnd:
             return False
 
-        # Restore if minimized
-        SW_RESTORE = 9
-        user32.ShowWindow(target_hwnd, SW_RESTORE)
+        # Розгортаємо тільки якщо згорнуте,
+        # зберігаючи попередній стан (maximized / normal).
+        restore_window_keep_state(target_hwnd)
 
         # Bypass Windows SetForegroundWindow restrictions using ALT key pulse
         VK_MENU = 0x12
@@ -222,6 +282,52 @@ async def activate_page(page):
         )
 
     await page.bring_to_front()
+
+
+# ============================================================
+# Search input helper
+# ============================================================
+
+async def type_search_query(
+    page,
+    selector,
+    query,
+    delay=70
+):
+    """
+    Єдина логіка введення в поле пошуку
+    (взята з Concord):
+
+        1. дочекатися поля;
+        2. клік;
+        3. повністю очистити (fill "");
+        4. ввести query людським темпом.
+
+    Очищення через fill("") гарантує, що в полі
+    не залишиться запит з попереднього сеансу.
+    """
+
+    search_input = page.locator(
+        selector
+    ).first
+
+    await search_input.wait_for(
+        state="visible",
+        timeout=10000
+    )
+
+    await search_input.click()
+
+    await search_input.fill(
+        ""
+    )
+
+    await search_input.press_sequentially(
+        query,
+        delay=delay
+    )
+
+    return search_input
 
 # ============================================================
 # Browser lifecycle helper

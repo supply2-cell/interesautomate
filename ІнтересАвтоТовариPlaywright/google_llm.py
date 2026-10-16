@@ -1,4 +1,5 @@
 from pathlib import Path
+import tkinter as tk
 from tkinter import ttk
 from playwright_app_general import compact_button, bind_universal_clipboard
 
@@ -21,11 +22,23 @@ OUTPUT_DIR = Path(__file__).with_name(
     "product_output"
 )
 
+# Файли, які пишуть MARTEX / OPOLTRANS «Витягнути товар».
+# Кнопка «Забрати товар» читає їх у поля Name / OEM.
+PRODUCT_NAME_FILE = OUTPUT_DIR / "name_desc_to_process.txt"
+PRODUCT_OEM_FILE = OUTPUT_DIR / "oem_main.txt"
+
+# Кеш значень полів.
+#
+# Команди виконуються в робочих потоках, тому вони
+# читають ці змінні, а не Tk-віджети напряму.
+# Кеш оновлюється з полів при БУДЬ-якій зміні
+# (введення, вставка мишкою, програмний запис).
 _current_name = ""
 _current_oem = ""
 
-_name_entry = None
-_oem_entry = None
+_name_var = None
+_oem_var = None
+_root = None
 
 
 # ============================================================
@@ -610,10 +623,42 @@ async def llm_extract():
 # Data
 # ============================================================
 
-def set_data(value):
+def _run_in_ui(function):
+    """
+    Виконує function у головному Tk-потоці.
+    """
+
+    if _root is None:
+
+        function()
+        return
+
+    _root.after(0, function)
+
+
+def _apply_fields(name, oem):
+    """
+    Записує значення в кеш та (асинхронно) в поля UI.
+    """
 
     global _current_name
     global _current_oem
+
+    _current_name = str(name or "").strip()
+    _current_oem = str(oem or "").strip()
+
+    def update():
+
+        if _name_var is not None:
+            _name_var.set(_current_name)
+
+        if _oem_var is not None:
+            _oem_var.set(_current_oem)
+
+    _run_in_ui(update)
+
+
+def set_data(value):
 
     if not isinstance(
         value,
@@ -625,92 +670,131 @@ def set_data(value):
             "value має бути об'єктом."
         )
 
-    name = value.get(
-        "name",
-        ""
+    _apply_fields(
+        value.get("name") or "",
+        value.get("oem") or ""
     )
 
-    oem = value.get(
-        "oem",
-        ""
+
+def _read_output_file(path):
+
+    if not path.exists():
+
+        return ""
+
+    return path.read_text(
+        encoding="utf-8-sig"
+    ).strip()
+
+
+def load_product():
+    """
+    «Забрати товар»:
+
+        name_desc_to_process.txt -> Name
+        oem_main.txt             -> OEM
+    """
+
+    name = _read_output_file(
+        PRODUCT_NAME_FILE
     )
 
-    _current_name = str(
-        name
-        if name is not None
-        else ""
-    ).strip()
+    oem = _read_output_file(
+        PRODUCT_OEM_FILE
+    )
 
-    _current_oem = str(
-        oem
-        if oem is not None
-        else ""
-    ).strip()
+    if not name and not oem:
 
-    update_ui_fields()
-
-
-def update_ui_fields():
-
-    if _name_entry is not None:
-
-        _name_entry.delete(
-            0,
-            "end"
+        return (
+            "Google LLM: файли товару порожні — "
+            "спочатку «Витягнути товар» у Martex / Opoltrans."
         )
 
-        _name_entry.insert(
-            0,
-            _current_name
-        )
+    _apply_fields(name, oem)
 
-    if _oem_entry is not None:
-
-        _oem_entry.delete(
-            0,
-            "end"
-        )
-
-        _oem_entry.insert(
-            0,
-            _current_oem
-        )
+    return (
+        "Google LLM: товар забрано — "
+        f"Name={name}, OEM={oem}"
+    )
 
 
-def on_name_changed(
-    event=None
-):
+def clean():
+    """
+    Очищення UI при новому пошуку з Excel.
+
+    Викликається playwright_app у головному потоці.
+    """
+
+    _apply_fields("", "")
+
+
+def _on_name_var_changed(*_args):
 
     global _current_name
 
-    if _name_entry is not None:
-
-        _current_name = (
-            _name_entry.get()
-        )
+    if _name_var is not None:
+        _current_name = _name_var.get()
 
 
-def on_oem_changed(
-    event=None
-):
+def _on_oem_var_changed(*_args):
 
     global _current_oem
 
-    if _oem_entry is not None:
-
-        _current_oem = (
-            _oem_entry.get()
-        )
+    if _oem_var is not None:
+        _current_oem = _oem_var.get()
 
 
 # ============================================================
 # google UI
 # ============================================================
 
+def _labeled_entry(parent, label, variable):
+
+    entry_frame = ttk.Frame(
+        parent,
+        style="Compact.TFrame"
+    )
+
+    entry_frame.pack(
+        fill="x",
+        pady=(0, 1)
+    )
+
+    ttk.Label(
+        entry_frame,
+        text=label,
+        style="Compact.TLabel"
+    ).pack(
+        anchor="w"
+    )
+
+    entry = ttk.Entry(
+        entry_frame,
+        textvariable=variable,
+        style="Compact.TEntry"
+    )
+
+    entry.pack(
+        fill="x"
+    )
+
+    bind_universal_clipboard(
+        entry
+    )
+
+    return entry
+
+
 def create_ui(
     parent,
     run_command
 ):
+
+    global _name_var
+    global _oem_var
+    global _root
+
+    _root = parent.winfo_toplevel()
 
     frame = ttk.LabelFrame(
         parent,
@@ -719,91 +803,28 @@ def create_ui(
         style="Compact.TLabelframe"
     )
 
-    # --------------------------------------------------------
-    # NAME
-    # --------------------------------------------------------
-
-    name_frame = ttk.Frame(
-        frame,
-        style="Compact.TFrame"
+    _name_var = tk.StringVar(
+        master=frame,
+        value=_current_name
     )
 
-    name_frame.pack(
-        fill="x",
-        pady=(0, 1)
+    _oem_var = tk.StringVar(
+        master=frame,
+        value=_current_oem
     )
 
-    ttk.Label(
-        name_frame,
-        text="Name:",
-        style="Compact.TLabel"
-    ).pack(
-        anchor="w"
+    _name_var.trace_add(
+        "write",
+        _on_name_var_changed
     )
 
-    name_entry = ttk.Entry(
-        name_frame,
-        style="Compact.TEntry"
+    _oem_var.trace_add(
+        "write",
+        _on_oem_var_changed
     )
 
-    name_entry.pack(
-        fill="x"
-    )
-
-    name_entry.bind(
-        "<KeyRelease>",
-        on_name_changed
-    )
-
-    bind_universal_clipboard(
-        name_entry
-    )
-
-    # --------------------------------------------------------
-    # OEM
-    # --------------------------------------------------------
-
-    oem_frame = ttk.Frame(
-        frame,
-        style="Compact.TFrame"
-    )
-
-    oem_frame.pack(
-        fill="x",
-        pady=(0, 1)
-    )
-
-    ttk.Label(
-        oem_frame,
-        text="OEM:",
-        style="Compact.TLabel"
-    ).pack(
-        anchor="w"
-    )
-
-    oem_entry = ttk.Entry(
-        oem_frame,
-        style="Compact.TEntry"
-    )
-
-    oem_entry.pack(
-        fill="x"
-    )
-
-    oem_entry.bind(
-        "<KeyRelease>",
-        on_oem_changed
-    )
-
-    bind_universal_clipboard(
-        oem_entry
-    )
-
-    global _name_entry
-    global _oem_entry
-
-    _name_entry = name_entry
-    _oem_entry = oem_entry
+    _labeled_entry(frame, "Name:", _name_var)
+    _labeled_entry(frame, "OEM:", _oem_var)
 
     # --------------------------------------------------------
     # BUTTONS
@@ -828,69 +849,30 @@ def create_ui(
         weight=1
     )
 
-    # --------------------------------------------------------
-    # PREPARE
-    # --------------------------------------------------------
+    layout = [
+        ("Забрати товар", "LLM_LOAD_PRODUCT", 0, 0, 2),
+        ("LLM PREPARE", "LLM_PREPARE", 1, 0, 1),
+        ("LLM PROCESS", "LLM_PROCESS", 1, 1, 1),
+        ("LLM EXTRACT", "LLM_EXTRACT", 2, 0, 2),
+    ]
 
-    prepare_button = compact_button(
-        buttons,
-        text="LLM PREPARE",
-        command=lambda: run_command(
-            "GOOGLE_LLM",
-            "LLM_PREPARE"
+    for text, command, row, column, span in layout:
+
+        compact_button(
+            buttons,
+            text=text,
+            command=lambda c=command: run_command(
+                "GOOGLE_LLM",
+                c
+            )
+        ).grid(
+            row=row,
+            column=column,
+            columnspan=span,
+            padx=1,
+            pady=1,
+            sticky="ew"
         )
-    )
-
-    prepare_button.grid(
-        row=0,
-        column=0,
-        padx=1,
-        pady=1,
-        sticky="ew"
-    )
-
-    # --------------------------------------------------------
-    # PROCESS
-    # --------------------------------------------------------
-
-    process_button = compact_button(
-        buttons,
-        text="LLM PROCESS",
-        command=lambda: run_command(
-            "GOOGLE_LLM",
-            "LLM_PROCESS"
-        )
-    )
-
-    process_button.grid(
-        row=0,
-        column=1,
-        padx=1,
-        pady=1,
-        sticky="ew"
-    )
-
-    # --------------------------------------------------------
-    # EXTRACT
-    # --------------------------------------------------------
-
-    extract_button = compact_button(
-        buttons,
-        text="LLM EXTRACT",
-        command=lambda: run_command(
-            "GOOGLE_LLM",
-            "LLM_EXTRACT"
-        )
-    )
-
-    extract_button.grid(
-        row=1,
-        column=0,
-        columnspan=2,
-        padx=1,
-        pady=1,
-        sticky="ew"
-    )
 
     return frame
 
@@ -920,6 +902,10 @@ async def handle_command(
             f"Name={_current_name}, "
             f"OEM={_current_oem}"
         )
+
+    if action == "LLM_LOAD_PRODUCT":
+
+        return load_product()
 
     if action == "LLM_PREPARE":
 

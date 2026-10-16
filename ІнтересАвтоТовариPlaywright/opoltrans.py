@@ -1,9 +1,10 @@
 from pathlib import Path
 from tkinter import ttk
-from playwright_app_general import compact_button, bind_universal_clipboard
+from playwright_app_general import compact_button
 
 import playwright_app_general
 import browser
+import producer_map
 
 
 # ============================================================
@@ -30,13 +31,9 @@ PRODUCT_OUTPUT_DIR = Path(__file__).with_name(
 )
 
 
-# ============================================================
-# UI references
-# ============================================================
-
-_name_entry = None
-_oem_entry = None
-_root = None
+# Назва/опис товару для LLM.
+# GOOGLE_LLM читає його кнопкою «Забрати товар».
+NAME_DESC_FILE = "name_desc_to_process.txt"
 
 
 # ============================================================
@@ -458,7 +455,25 @@ async def extract_direct_oem(page):
     if await oem_span.count() == 0:
         return ""
 
-    return (await oem_span.first.locator("xpath=text()").all_text_contents())[0].strip()
+    # Playwright-локатори не вміють повертати текстові вузли (xpath=text()),
+    # тому беремо лише прямий текст span-а, без вкладених кнопок/іконок.
+    oem = await oem_span.first.evaluate(
+        """el => Array.from(el.childNodes)
+            .filter(n => n.nodeType === Node.TEXT_NODE)
+            .map(n => n.textContent)
+            .join('')"""
+    )
+
+    oem = " ".join((oem or "").split()).strip()
+
+    if not oem:
+        # запасний варіант: атрибут кнопки копіювання
+        btn = oem_span.first.locator("[data-js-copyphrase-phrase]")
+        if await btn.count() > 0:
+            oem = (await btn.first.get_attribute("data-js-copyphrase-phrase") or "").strip()
+
+    return oem
+
 
 
 # ============================================================
@@ -468,53 +483,53 @@ async def extract_direct_oem(page):
 async def extract_direct_producer(page):
     """
     Витягує виробника з блоку товару.
-
+ 
     Структура:
         div.mod-item-view
             └── div.content
                 └── h4
                     Producent: DAF
     """
-
+ 
     content = page.locator(
         "div.mod-item-view div.content"
     )
-
+ 
     if await content.count() == 0:
-
+ 
         return ""
-
+ 
     h4_list = content.locator(
         "h4"
     )
-
+ 
     count = await h4_list.count()
-
+ 
     for i in range(count):
-
+ 
         text = await h4_list.nth(i).inner_text()
-
+ 
         text = " ".join(
             text.split()
         ).strip()
-
+ 
         if not text:
-
+ 
             continue
-
-        if "Producent:" not in text:
-
+ 
+        if not text.startswith("Producent:"):
+ 
             continue
-
+ 
         producer = text.split(
             "Producent:",
             1
         )[1].strip()
-
+ 
         if producer:
-
+ 
             return producer
-
+ 
     return ""
 
 
@@ -580,21 +595,13 @@ async def extract_oems_and_producers(page):
 
 async def extract_main_oem(page):
     """
-    Визначає основний OEM.
+    Основний OEM (для oem_main.txt та артикля-OEM).
 
-    Пріоритет:
+    Без пошуку по виробниках:
 
     1. Numer prod.
-    2. Якщо його немає:
-       шукаємо OEM за Producent.
-    3. Якщо виробника немає або
-       відповідного OEM не знайдено:
-       беремо перший OEM таблиці.
+    2. Якщо його немає — перший OEM таблиці.
     """
-
-    # --------------------------------------------------------
-    # 1. Прямий Numer prod.
-    # --------------------------------------------------------
 
     direct_oem = await extract_direct_oem(
         page
@@ -604,56 +611,11 @@ async def extract_main_oem(page):
 
         return direct_oem
 
-    # --------------------------------------------------------
-    # Витягуємо OEM-таблицю
-    # --------------------------------------------------------
-
-    oems, producers = (
+    oems, _producers = (
         await extract_oems_and_producers(
             page
         )
     )
-
-    # --------------------------------------------------------
-    # 2. Шукаємо OEM за виробником
-    # --------------------------------------------------------
-
-    producer = await extract_direct_producer(
-        page
-    )
-
-    if producer:
-
-        producer_normalized = (
-            producer.strip().casefold()
-        )
-
-        for index, table_producer in enumerate(
-            producers
-        ):
-
-            table_producer_normalized = (
-                table_producer
-                .strip()
-                .casefold()
-            )
-
-            if (
-                table_producer_normalized
-                and
-                table_producer_normalized
-                == producer_normalized
-            ):
-
-                if index < len(oems):
-
-                    return oems[
-                        index
-                    ].strip()
-
-    # --------------------------------------------------------
-    # 3. Беремо перший OEM
-    # --------------------------------------------------------
 
     if oems:
 
@@ -684,55 +646,6 @@ def save_product_output(
 
 
 # ============================================================
-# UI update
-# ============================================================
-
-def update_product_fields(data):
-    """
-    Оновлює поля Opoltrans.
-
-    Викликається через root.after(),
-    тобто в основному Tkinter thread.
-    """
-
-    name = str(
-        data.get("name", "")
-        if isinstance(data, dict)
-        else ""
-    ).strip()
-
-    oem = str(
-        data.get("oem", "")
-        if isinstance(data, dict)
-        else ""
-    ).strip()
-
-    if _name_entry is not None:
-
-        _name_entry.delete(
-            0,
-            "end"
-        )
-
-        _name_entry.insert(
-            0,
-            name
-        )
-
-    if _oem_entry is not None:
-
-        _oem_entry.delete(
-            0,
-            "end"
-        )
-
-        _oem_entry.insert(
-            0,
-            oem
-        )
-
-
-# ============================================================
 # Search
 # ============================================================
 
@@ -750,13 +663,12 @@ async def search():
             context
         )
 
-        # ----------------------------------------------------
-        # Активуємо вкладку та Edge
-        # ----------------------------------------------------
-
         await activate_page(
             page
         )
+
+        # Edge на передній план.
+        browser.bring_edge_window_to_front()
 
         # ----------------------------------------------------
         # Тип пошуку
@@ -770,34 +682,17 @@ async def search():
 
             await search_type.check()
 
-        # ----------------------------------------------------
-        # Поле пошуку
-        # ----------------------------------------------------
-
-        search_input = page.locator(
-            "#text-input-searcher"
+        # Поле очищається повністю перед введенням.
+        await browser.type_search_query(
+            page,
+            "#text-input-searcher",
+            query
         )
 
-        await search_input.click()
-
-        # ----------------------------------------------------
-        # Людський темп введення
-        # ----------------------------------------------------
-
-        await search_input.press_sequentially(
-            query,
-            delay=70
-        )
-
-        # ----------------------------------------------------
-        # Кнопка пошуку
-        # ----------------------------------------------------
-
-        search_button = page.locator(
+        # Результатів НЕ чекаємо.
+        await page.locator(
             "#search-submit"
-        )
-
-        await search_button.click()
+        ).click()
 
         return (
             f"Пошук Opoltrans: "
@@ -818,19 +713,15 @@ async def search():
 
 async def get_product():
     """
-    Повністю витягує товар:
+    Витягує товар:
 
-        Name
-        supplier_code
-        main OEM
-        price
+        name           -> name_desc_to_process.txt
+        main OEM       -> oem_main.txt
+        supplier_code  -> supplier_code.txt
+        price          -> price.txt
 
-    Name та OEM передаються
-    у UI-поля Opoltrans.
-
-    supplier_code, OEM
-    та price записуються
-    у product_output.
+    GOOGLE_LLM забирає name + OEM з файлів
+    кнопкою «Забрати товар».
     """
 
     playwright, browser_instance, context = (
@@ -842,10 +733,6 @@ async def get_product():
         page = await get_product_page(
             context
         )
-
-        # ----------------------------------------------------
-        # Активуємо сторінку ДО взаємодії
-        # ----------------------------------------------------
 
         await activate_page(
             page
@@ -887,24 +774,17 @@ async def get_product():
             )
         )
 
-        result = {
+        save_product_output(
+            NAME_DESC_FILE,
+            name
+        )
+
+        return {
             "name": name,
             "oem": oem_main,
             "supplier_code": supplier_code,
             "price": price
         }
-
-        if _root is not None:
-
-            _root.after(
-                0,
-                lambda data=result:
-                    update_product_fields(
-                        data
-                    )
-            )
-
-        return result
 
     finally:
 
@@ -915,35 +795,23 @@ async def get_product():
 
 
 # ============================================================
-# Article MG
+# Articles
+#
+# Підстановка виробника — producers_opoltrans.csv.
+# Виробника немає у словнику -> пишемо як є.
+# Виробника немає взагалі    -> тільки основа.
 # ============================================================
 
-async def make_article_mg(page):
-    """
-    Формує внутрішній артикль MG.
+def _save_article(article):
 
-    15-02-01-0293
-    ->
-    1502010293MG
-    """
-
-    supplier_code = (
-        await extract_supplier_code(
-            page
-        )
-    )
-
-    article = (
-        supplier_code
-        .replace("-", "")
-        .strip()
-        + "MG"
-    )
+    article = " ".join(
+        str(article or "").split()
+    ).strip()
 
     if not article:
 
         raise RuntimeError(
-            "Не вдалося сформувати Артикль-MG."
+            "Не вдалося сформувати артикль."
         )
 
     save_product_output(
@@ -954,19 +822,37 @@ async def make_article_mg(page):
     return article
 
 
-# ============================================================
-# Article OEM
-# ============================================================
+async def make_article_symbol(page):
+    """
+    Варіант 2: Symbol + виробник(підстановка).
+
+        15-02-01-0293 + DAF -> 1502010293DAF
+    """
+
+    supplier_code = (
+        await extract_supplier_code(
+            page
+        )
+    )
+
+    producer = await extract_direct_producer(
+        page
+    )
+
+    return _save_article(
+        producer_map.build_article(
+            supplier_code.replace("-", ""),
+            producer,
+            producer_map.OPOLTRANS_PRODUCERS_FILE
+        )
+    )
+
 
 async def make_article_oem(page):
     """
-    Формує OEM-артикль.
+    Варіант 1: OEM + виробник(підстановка).
 
-    При наявності виробника:
-        1997220DAF
-
-    Якщо виробника немає:
-        1997220
+        1997220 + DAF -> 1997220DAF
     """
 
     oem = await extract_main_oem(
@@ -980,32 +866,17 @@ async def make_article_oem(page):
             "основний OEM."
         )
 
-    producer = (
-        await extract_direct_producer(
-            page
-        )
+    producer = await extract_direct_producer(
+        page
     )
 
-    if producer:
-
-        article = (
-            f"{oem}{producer}"
+    return _save_article(
+        producer_map.build_article(
+            oem,
+            producer,
+            producer_map.OPOLTRANS_PRODUCERS_FILE
         )
-
-    else:
-
-        article = oem
-
-    article = " ".join(
-        article.split()
-    ).strip()
-
-    save_product_output(
-        "article.txt",
-        article
     )
-
-    return article
 
 
 # ============================================================
@@ -1050,71 +921,17 @@ async def handle_extract_oems(page):
 
 
 # ============================================================
-# Send Name + OEM to LLM
-# ============================================================
-
-def send_name_oem_to_llm(
-    run_command
-):
-
-    name = ""
-
-    if _name_entry is not None:
-
-        name = _name_entry.get().strip()
-
-    oem = ""
-
-    if _oem_entry is not None:
-
-        oem = _oem_entry.get().strip()
-
-    if not name:
-
-        print(
-            "[OPOLTRANS] "
-            "Не задано назву товару для LLM."
-        )
-
-        return
-
-    if not oem:
-
-        print(
-            "[OPOLTRANS] "
-            "Не задано OEM для LLM."
-        )
-
-        return
-
-    value = {
-        "name": name,
-        "oem": oem
-    }
-
-    run_command(
-        "GOOGLE_LLM",
-        "LLM_SET_DATA",
-        value
-    )
-
-# ============================================================
-# opoltrans UI
+# Opoltrans UI
+#
+# Текстових полів немає: назва та OEM пишуться у файли
+# (name_desc_to_process.txt, oem_main.txt),
+# а GOOGLE_LLM забирає їх кнопкою «Забрати товар».
 # ============================================================
 
 def create_ui(
     parent,
     run_command
 ):
-    """
-    Створює UI Opoltrans.
-    """
-
-    global _name_entry
-    global _oem_entry
-    global _root
-
-    _root = parent.winfo_toplevel()
 
     frame = ttk.LabelFrame(
         parent,
@@ -1122,80 +939,6 @@ def create_ui(
         padding=1,
         style="Compact.TLabelframe"
     )
-
-    # --------------------------------------------------------
-    # Name
-    # --------------------------------------------------------
-
-    title_frame = ttk.Frame(
-        frame,
-        style="Compact.TFrame"
-    )
-
-    title_frame.pack(
-        fill="x",
-        pady=(0, 1)
-    )
-
-    ttk.Label(
-        title_frame,
-        text="На розбір - ополтранс:",
-        style="Compact.TLabel"
-    ).pack(
-        anchor="w"
-    )
-
-    _name_entry = ttk.Entry(
-        title_frame,
-        style="Compact.TEntry"
-    )
-
-    _name_entry.pack(
-        fill="x"
-    )
-
-    bind_universal_clipboard(
-        _name_entry
-    )
-
-    # --------------------------------------------------------
-    # OEM
-    # --------------------------------------------------------
-
-    oem_frame = ttk.Frame(
-        frame,
-        style="Compact.TFrame"
-    )
-
-    oem_frame.pack(
-        fill="x",
-        pady=(0, 1)
-    )
-
-    ttk.Label(
-        oem_frame,
-        text="OEM Opoltrans:",
-        style="Compact.TLabel"
-    ).pack(
-        anchor="w"
-    )
-
-    _oem_entry = ttk.Entry(
-        oem_frame,
-        style="Compact.TEntry"
-    )
-
-    _oem_entry.pack(
-        fill="x"
-    )
-
-    bind_universal_clipboard(
-        _oem_entry
-    )
-
-    # --------------------------------------------------------
-    # Buttons
-    # --------------------------------------------------------
 
     buttons = ttk.Frame(
         frame,
@@ -1216,141 +959,35 @@ def create_ui(
         weight=1
     )
 
-    # --------------------------------------------------------
-    # Search
-    # --------------------------------------------------------
+    layout = [
+        ("Пошук", "SEARCH", 0, 0, 1),
+        ("Витягнути товар", "GET_PRODUCT", 0, 1, 1),
+        ("Артикль = OEM + вир.", "ARTICLE_OEM", 1, 0, 1),
+        ("Артикль = Symbol + вир.", "ARTICLE_SYMBOL", 1, 1, 1),
+        ("Витягнути ОЕМи", "EXTRACT_OEMS", 2, 0, 2),
+    ]
 
-    search_button = compact_button(
-        buttons,
-        text="Пошук",
-        command=lambda:
-            run_command(
+    for text, command, row, column, span in layout:
+
+        compact_button(
+            buttons,
+            text=text,
+            command=lambda c=command: run_command(
                 "OPOLTRANS",
-                "SEARCH"
+                c
             )
-    )
-
-    search_button.grid(
-        row=0,
-        column=0,
-        padx=1,
-        pady=1,
-        sticky="ew"
-    )
-
-    # --------------------------------------------------------
-    # Get product
-    # --------------------------------------------------------
-
-    product_button = compact_button(
-        buttons,
-        text="Витягнути товар",
-        command=lambda:
-            run_command(
-                "OPOLTRANS",
-                "GET_PRODUCT"
-            )
-    )
-
-    product_button.grid(
-        row=0,
-        column=1,
-        padx=1,
-        pady=1,
-        sticky="ew"
-    )
-
-    # --------------------------------------------------------
-    # Article MG
-    # --------------------------------------------------------
-
-    article_mg_button = compact_button(
-        buttons,
-        text="Артикль-MG",
-        command=lambda:
-            run_command(
-                "OPOLTRANS",
-                "ARTICLE_MG"
-            )
-    )
-
-    article_mg_button.grid(
-        row=1,
-        column=0,
-        padx=1,
-        pady=1,
-        sticky="ew"
-    )
-
-    # --------------------------------------------------------
-    # Article OEM
-    # --------------------------------------------------------
-
-    article_oem_button = compact_button(
-        buttons,
-        text="Артикль-ОЕМ",
-        command=lambda:
-            run_command(
-                "OPOLTRANS",
-                "ARTICLE_OEM"
-            )
-    )
-
-    article_oem_button.grid(
-        row=1,
-        column=1,
-        padx=1,
-        pady=1,
-        sticky="ew"
-    )
-
-    # --------------------------------------------------------
-    # OEMs
-    # --------------------------------------------------------
-
-    oems_button = compact_button(
-        buttons,
-        text="Витягнути ОЕМи",
-        command=lambda:
-            run_command(
-                "OPOLTRANS",
-                "EXTRACT_OEMS"
-            )
-    )
-
-    oems_button.grid(
-        row=2,
-        column=0,
-        columnspan=2,
-        padx=1,
-        pady=1,
-        sticky="ew"
-    )
-
-    # --------------------------------------------------------
-    # LLM
-    # --------------------------------------------------------
-
-    llm_button = compact_button(
-        buttons,
-        text="Передати Name + OEM в LLM",
-        command=lambda:
-            send_name_oem_to_llm(
-                run_command
-            )
-    )
-
-    llm_button.grid(
-        row=3,
-        column=0,
-        columnspan=2,
-        padx=1,
-        pady=1,
-        sticky="ew"
-    )
+        ).grid(
+            row=row,
+            column=column,
+            columnspan=span,
+            padx=1,
+            pady=1,
+            sticky="ew"
+        )
 
     return frame
-    
+
+
 # ============================================================
 # Command handler
 # ============================================================
@@ -1382,10 +1019,8 @@ async def handle_command(
                     "value має бути рядком."
                 )
 
-            value = value.strip()
-
             playwright_app_general.set_query(
-                value
+                value.strip()
             )
 
         return await search()
@@ -1399,10 +1034,10 @@ async def handle_command(
         return await get_product()
 
     # --------------------------------------------------------
-    # ARTICLE MG
+    # ARTICLE SYMBOL (ARTICLE_MG — стара назва для VBA)
     # --------------------------------------------------------
 
-    if action == "ARTICLE_MG":
+    if action in ("ARTICLE_SYMBOL", "ARTICLE_MG"):
 
         playwright, browser_instance, context = (
             await browser.connect()
@@ -1418,7 +1053,7 @@ async def handle_command(
                 page
             )
 
-            return await make_article_mg(
+            return await make_article_symbol(
                 page
             )
 

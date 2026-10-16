@@ -1,3 +1,4 @@
+import sys
 import tkinter as tk
 from tkinter import ttk
 
@@ -8,6 +9,13 @@ from tkinter import ttk
 
 _query_entry = None
 
+# Кеш Query.
+#
+# get_query() викликається з робочих потоків модулів,
+# а Tk-віджети не можна чіпати не з головного потоку.
+# Тому читаємо кеш, який оновлюється з самого Entry.
+_current_query = ""
+
 
 # ============================================================
 # Query
@@ -16,7 +24,12 @@ _query_entry = None
 def set_query(value):
     """
     Встановлює Query у головному полі General.
+
+    Викликати з головного Tk-потоку
+    (playwright_app робить це сам для команд з Excel).
     """
+
+    global _current_query
 
     if not isinstance(
         value,
@@ -37,24 +50,29 @@ def set_query(value):
             "порожній запит."
         )
 
-    if _query_entry is None:
+    _current_query = query
 
-        raise RuntimeError(
-            "GENERAL: "
-            "не підключено Query entry."
+    if _query_entry is not None:
+
+        _query_entry.delete(
+            0,
+            tk.END
         )
 
-    _query_entry.delete(
-        0,
-        tk.END
-    )
-
-    _query_entry.insert(
-        0,
-        query
-    )
+        _query_entry.insert(
+            0,
+            query
+        )
 
     return query
+
+
+def peek_query():
+    """
+    Поточний Query без перевірок (може бути "").
+    """
+
+    return _current_query
 
 
 def get_query():
@@ -62,14 +80,7 @@ def get_query():
     Повертає поточний Query з General.
     """
 
-    if _query_entry is None:
-
-        raise RuntimeError(
-            "GENERAL: "
-            "не підключено Query entry."
-        )
-
-    query = _query_entry.get().strip()
+    query = _current_query.strip()
 
     if not query:
 
@@ -79,6 +90,15 @@ def get_query():
         )
 
     return query
+
+
+def _on_query_changed(*_args):
+
+    global _current_query
+
+    if _query_entry is not None:
+
+        _current_query = _query_entry.get()
 
 
 # ============================================================
@@ -113,12 +133,29 @@ def create_ui(
         anchor="w"
     )
 
-    _query_entry = ttk.Entry(
-        query_frame
+    query_var = tk.StringVar(
+        master=query_frame
     )
+
+    query_var.trace_add(
+        "write",
+        _on_query_changed
+    )
+
+    _query_entry = ttk.Entry(
+        query_frame,
+        textvariable=query_var
+    )
+
+    # StringVar має жити разом з віджетом.
+    _query_entry._query_var = query_var
 
     _query_entry.pack(
         fill="x"
+    )
+
+    bind_universal_clipboard(
+        _query_entry
     )
 
     return frame
@@ -139,6 +176,8 @@ async def handle_command(
 
     if action == "SET_QUERY":
 
+        # Сюди потрапляє лише якщо playwright_app
+        # не обробив SET_QUERY сам у головному потоці.
         return set_query(
             value
         )
@@ -222,267 +261,263 @@ def configure_styles():
         pass
 
 
-# ------------------------------------------------------------
-# Незалежні від локалі Ctrl+C / Ctrl+V / Ctrl+A
-# ------------------------------------------------------------
+# ============================================================
+# Буфер обміну / редагування
+#
+# Ми НЕ пишемо власну логіку копіювання/вставки.
+# Tk уже вміє це робити у полях Entry/Text через
+# стандартні віртуальні події:
+#
+#     <<Copy>>  <<Paste>>  <<Cut>>
+#
+# Проблема лише в тому, що стандартні прив'язки Tk
+# реагують на Control-c / Control-v за СИМВОЛОМ клавіші,
+# тому в українській/російській розкладці (Ctrl+С = "с")
+# вони не спрацьовують.
+#
+# Тому ловимо Ctrl+клавіша за фізичним кодом клавіші
+# (Windows virtual-key code, однаковий у будь-якій
+# розкладці) і просто генеруємо стандартну подію Tk.
+#
+# readonly=True:
+#     дозволено виділення, копіювання, Ctrl+A, навігацію;
+#     заборонено введення, вставку, вирізання, видалення.
+#     Програмне insert()/delete() працює як і раніше.
+# ============================================================
 
-def _is_ctrl_key(event):
-    """
-    Визначає Ctrl незалежно від поточної розкладки.
-    """
+# Windows virtual-key codes (не залежать від розкладки).
+_VK_ACTIONS = {
+    65: "select_all",   # A
+    67: "copy",         # C
+    86: "paste",        # V
+    88: "cut",          # X
+}
 
-    try:
-        return bool(
-            event.state & 0x0004
+# Fallback за keysym (Linux/macOS та латиниця/кирилиця).
+_KEYSYM_ACTIONS = {
+    "a": "select_all",
+    "c": "copy",
+    "v": "paste",
+    "x": "cut",
+    # Ті самі фізичні клавіші в кириличній розкладці
+    "cyrillic_ef": "select_all",   # ф
+    "cyrillic_es": "copy",         # с
+    "cyrillic_em": "paste",        # м
+    "cyrillic_che": "cut",         # ч
+}
+
+_VIRTUAL_EVENTS = {
+    "copy": "<<Copy>>",
+    "paste": "<<Paste>>",
+    "cut": "<<Cut>>",
+}
+
+# Клавіші, які дозволені в readonly-полі.
+_READONLY_ALLOWED_KEYS = {
+    "left", "right", "up", "down",
+    "home", "end", "prior", "next",
+    "tab", "iso_left_tab", "escape",
+    "shift_l", "shift_r",
+    "control_l", "control_r",
+    "alt_l", "alt_r",
+    "caps_lock", "num_lock",
+    "insert",  # Ctrl+Insert = копіювати
+}
+
+
+def _ctrl_action(event):
+
+    if sys.platform == "win32":
+
+        action = _VK_ACTIONS.get(
+            getattr(event, "keycode", None)
         )
 
-    except Exception:
-        return False
+        if action:
+            return action
+
+    return _KEYSYM_ACTIONS.get(
+        str(event.keysym).lower()
+    )
 
 
-def _is_key(event, *keys):
-    """
-    Перевірка клавіші без залежності від текстового символу.
-    """
+def _is_readonly(widget):
 
-    try:
-
-        keysym = (
-            str(
-                event.keysym
-            ).lower()
-        )
-
-        keycode = getattr(
-            event,
-            "keycode",
-            None
-        )
-
-        return (
-            keysym in keys
-            or
-            (
-                keycode is not None
-                and str(keycode) in keys
-            )
-        )
-
-    except Exception:
-
-        return False
+    return bool(
+        getattr(widget, "_clipboard_readonly", False)
+    )
 
 
-def universal_copy(event):
-    """
-    Ctrl+C незалежно від локалі клавіатури.
-    Працює з Text та Entry.
-    """
+def _select_all(widget):
 
-    if not _is_ctrl_key(event):
+    if isinstance(widget, tk.Text):
+
+        widget.tag_add("sel", "1.0", "end-1c")
+        widget.mark_set("insert", "end-1c")
+        widget.see("insert")
+
+    else:
+
+        widget.selection_range(0, "end")
+        widget.icursor("end")
+
+
+def _run_action(widget, action):
+
+    if action == "select_all":
+
+        _select_all(widget)
         return
 
-    if not _is_key(
-        event,
-        "c",
-        "67"
-    ):
+    if _is_readonly(widget) and action in ("paste", "cut"):
+
         return
 
-    widget = event.widget
-
-    try:
-
-        # Text
-        if isinstance(
-            widget,
-            tk.Text
-        ):
-
-            try:
-
-                selected = widget.get(
-                    "sel.first",
-                    "sel.last"
-                )
-
-            except tk.TclError:
-
-                return "break"
-
-        # Entry
-        else:
-
-            try:
-
-                selected = widget.selection_get()
-
-            except Exception:
-
-                return "break"
-
-        widget.clipboard_clear()
-
-        widget.clipboard_append(
-            selected
-        )
-
-        widget.update()
-
-    except Exception:
-
-        pass
-
-    return "break"
+    widget.event_generate(
+        _VIRTUAL_EVENTS[action]
+    )
 
 
-def universal_paste(event):
-    """
-    Ctrl+V незалежно від локалі клавіатури.
-    Працює з Text та Entry.
-    """
+def _on_ctrl_key(event):
 
-    if not _is_ctrl_key(event):
-        return
+    action = _ctrl_action(event)
 
-    if not _is_key(
-        event,
-        "v",
-        "86"
-    ):
-        return
+    if action is not None:
 
-    widget = event.widget
+        try:
+            _run_action(event.widget, action)
 
-    try:
-
-        value = widget.clipboard_get()
-
-    except Exception:
+        except tk.TclError:
+            pass
 
         return "break"
 
-    try:
+    # Інші Ctrl-комбінації в readonly-полі:
+    # дозволяємо лише навігацію (Ctrl+Home/End/стрілки).
+    if (
+        _is_readonly(event.widget)
+        and str(event.keysym).lower() not in _READONLY_ALLOWED_KEYS
+    ):
 
-        # Text
-        if isinstance(
-            widget,
-            tk.Text
-        ):
+        return "break"
 
-            try:
-                widget.delete(
-                    "sel.first",
-                    "sel.last"
-                )
-            except tk.TclError:
-                pass
+    return None
 
-            widget.insert(
-                tk.INSERT,
-                value
-            )
 
-        # Entry
-        else:
+def _on_readonly_key(event):
 
-            try:
+    if str(event.keysym).lower() in _READONLY_ALLOWED_KEYS:
 
-                widget.delete(
-                    "sel.first",
-                    "sel.last"
-                )
-
-            except Exception:
-                pass
-
-            widget.insert(
-                tk.INSERT,
-                value
-            )
-
-    except Exception:
-
-        pass
+        return None
 
     return "break"
 
 
-def universal_select_all(event):
-    """
-    Ctrl+A незалежно від локалі клавіатури.
-    """
+def _block(_event=None):
 
-    if not _is_ctrl_key(event):
-        return
+    return "break"
 
-    if not _is_key(
-        event,
-        "a",
-        "65"
-    ):
-        return
+
+def _show_context_menu(event):
 
     widget = event.widget
+    readonly = _is_readonly(widget)
 
     try:
+        widget.focus_set()
 
-        if isinstance(
-            widget,
-            tk.Text
-        ):
-
-            widget.tag_add(
-                "sel",
-                "1.0",
-                "end-1c"
-            )
-
-            widget.mark_set(
-                "insert",
-                "1.0"
-            )
-
-        else:
-
-            widget.selection_range(
-                0,
-                "end"
-            )
-
-            widget.icursor(
-                "end"
-            )
-
-    except Exception:
-
+    except tk.TclError:
         pass
+
+    menu = tk.Menu(
+        widget,
+        tearoff=0
+    )
+
+    if not readonly:
+
+        menu.add_command(
+            label="Вирізати",
+            accelerator="Ctrl+X",
+            command=lambda: _run_action(widget, "cut")
+        )
+
+    menu.add_command(
+        label="Копіювати",
+        accelerator="Ctrl+C",
+        command=lambda: _run_action(widget, "copy")
+    )
+
+    if not readonly:
+
+        menu.add_command(
+            label="Вставити",
+            accelerator="Ctrl+V",
+            command=lambda: _run_action(widget, "paste")
+        )
+
+    menu.add_separator()
+
+    menu.add_command(
+        label="Виділити все",
+        accelerator="Ctrl+A",
+        command=lambda: _run_action(widget, "select_all")
+    )
+
+    try:
+        menu.tk_popup(event.x_root, event.y_root)
+
+    finally:
+        menu.grab_release()
 
     return "break"
 
 
-def bind_universal_clipboard(widget):
+def bind_universal_clipboard(widget, readonly=False):
     """
-    Підключає універсальні Ctrl+C / Ctrl+V / Ctrl+A.
+    Підключає стандартне редагування до Entry / Text:
+
+        Ctrl+C / Ctrl+V / Ctrl+X / Ctrl+A
+        у будь-якій розкладці клавіатури
+        + контекстне меню на правій кнопці миші.
+
+    readonly=True — поле лише для читання
+    (виділення та копіювання дозволені).
     """
 
+    widget._clipboard_readonly = bool(readonly)
+
     widget.bind(
-        "<KeyPress>",
-        universal_copy,
-        add="+"
+        "<Control-KeyPress>",
+        _on_ctrl_key
     )
 
     widget.bind(
-        "<KeyPress>",
-        universal_paste,
-        add="+"
+        "<Button-3>",
+        _show_context_menu
     )
 
-    widget.bind(
-        "<KeyPress>",
-        universal_select_all,
-        add="+"
-    )
+    if readonly:
+
+        widget.bind(
+            "<KeyPress>",
+            _on_readonly_key
+        )
+
+        for sequence in (
+            "<<Paste>>",
+            "<<Cut>>",
+            "<<Clear>>",
+            "<<PasteSelection>>",
+            "<Button-2>",
+        ):
+
+            widget.bind(
+                sequence,
+                _block
+            )
+
+    return widget
 
 
 # ============================================================

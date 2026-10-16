@@ -159,104 +159,6 @@ def set_status(text):
     )
 
 
-def copy_status():
-
-    try:
-
-        selected_text = status_text.get(
-            "sel.first",
-            "sel.last"
-        )
-
-        root.clipboard_clear()
-
-        root.clipboard_append(
-            selected_text
-        )
-
-        root.update()
-
-    except tk.TclError:
-
-        pass
-
-
-def select_all_status():
-
-    status_text.tag_add(
-        "sel",
-        "1.0",
-        "end"
-    )
-
-    status_text.mark_set(
-        "insert",
-        "1.0"
-    )
-
-    status_text.see(
-        "insert"
-    )
-
-
-def show_status_context_menu(event):
-
-    context_menu = tk.Menu(
-        root,
-        tearoff=0
-    )
-
-    try:
-
-        status_text.get(
-            "sel.first",
-            "sel.last"
-        )
-
-        copy_state = "normal"
-
-    except tk.TclError:
-
-        copy_state = "disabled"
-
-    context_menu.add_command(
-        label="Копіювати",
-        command=copy_status,
-        state=copy_state
-    )
-
-    context_menu.add_command(
-        label="Виділити все",
-        command=select_all_status
-    )
-
-    context_menu.tk_popup(
-        event.x_root,
-        event.y_root
-    )
-
-
-def status_key_handler(event):
-
-    if (
-        event.state & 0x0004
-        and event.keysym.lower() == "c"
-    ):
-
-        copy_status()
-
-        return "break"
-
-    if (
-        event.state & 0x0004
-        and event.keysym.lower() == "a"
-    ):
-
-        select_all_status()
-
-        return "break"
-
-
 # ============================================================
 # Async / sync runner
 # ============================================================
@@ -496,6 +398,66 @@ def prepare_modules():
                 f"prepare_browser error:\n"
                 f"{error_text}"
             )
+
+
+def clean_modules():
+    """
+    Загальний lifecycle hook.
+
+    Будь-який модуль може мати:
+
+        def clean():
+
+    Викликається при НОВОМУ пошуку з Excel
+    (змінився Query), щоб очистити поля UI модулів
+    від попереднього товару.
+
+    Викликається в головному Tk-потоці,
+    тому clean() може напряму працювати з віджетами.
+    """
+
+    cleaned = []
+
+    for module_name, module in MODULES.items():
+
+        clean = getattr(
+            module,
+            "clean",
+            None
+        )
+
+        if not callable(
+            clean
+        ):
+
+            continue
+
+        try:
+
+            clean()
+
+            cleaned.append(
+                module_name
+            )
+
+        except Exception:
+
+            import traceback
+
+            error_text = (
+                traceback.format_exc()
+            )
+
+            print(
+                error_text
+            )
+
+            set_status(
+                f"{module_name} clean error:\n"
+                f"{error_text}"
+            )
+
+    return cleaned
 
 
 def shutdown_modules():
@@ -788,6 +750,53 @@ def handle_command(command):
         )
     ).strip().upper()
 
+    # --------------------------------------------------------
+    # Новий запит з Excel (SET_QUERY / SEARCH з value).
+    #
+    # Робимо в головному Tk-потоці:
+    #   1. якщо Query змінився — clean() усіх модулів;
+    #   2. записуємо Query в General.
+    #
+    # Модулю SEARCH далі передається value=None,
+    # бо Query вже встановлено.
+    # --------------------------------------------------------
+
+    if (
+        command_name in ("SET_QUERY", "SEARCH")
+        and isinstance(value, str)
+        and value.strip()
+    ):
+
+        query = value.strip()
+
+        if (
+            query
+            != playwright_app_general.peek_query().strip()
+        ):
+
+            cleaned = clean_modules()
+
+            if cleaned:
+
+                set_status(
+                    "Новий пошук — очищено: "
+                    + ", ".join(cleaned)
+                )
+
+        playwright_app_general.set_query(
+            query
+        )
+
+        if command_name == "SET_QUERY":
+
+            set_status(
+                f"Query: {query}"
+            )
+
+            return
+
+        value = None
+
     run_module_command(
         source=source,
         target=target,
@@ -1054,18 +1063,11 @@ status_text.configure(
 # Clipboard / selection
 # ------------------------------------------------------------
 
+# Статус — тільки для читання:
+# виділення, Ctrl+C, Ctrl+A, контекстне меню «Копіювати».
 bind_universal_clipboard(
-    status_text
-)
-
-
-# ------------------------------------------------------------
-# Існуючі обробники
-# ------------------------------------------------------------
-
-status_text.bind(
-    "<Button-3>",
-    show_status_context_menu
+    status_text,
+    readonly=True
 )
 
 

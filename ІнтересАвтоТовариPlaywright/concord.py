@@ -266,45 +266,22 @@ async def search():
         # Вводимо Query
         # ----------------------------------------------------
 
-        search_input = page.locator(
-            "#universal-search"
-        )
-
-        await search_input.wait_for(
-            state="visible",
-            timeout=10000
-        )
-
-        await search_input.click()
-
-        await search_input.fill(
-            ""
-        )
-
-        await search_input.press_sequentially(
-            query,
-            delay=70
+        await browser.type_search_query(
+            page,
+            "#universal-search",
+            query
         )
 
         # ----------------------------------------------------
-        # Запускаємо пошук
+        # Запускаємо пошук.
+        #
+        # Результатів НЕ чекаємо — далі користувач
+        # працює зі сторінкою сам.
         # ----------------------------------------------------
 
         await page.locator(
             "#search-btn"
         ).click()
-
-        await page.wait_for_load_state(
-            "domcontentloaded"
-        )
-
-        # ----------------------------------------------------
-        # Робимо вкладку активною
-        # ----------------------------------------------------
-
-        await activate_page(
-            page
-        )
 
         return (
             f"Concord: пошук виконано — "
